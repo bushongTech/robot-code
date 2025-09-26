@@ -1,36 +1,41 @@
+version: "3.9"
+
 services:
   lavinmq:
-    image: cloudamqp/lavinmq:latest
-    container_name: lavinmq0            # <- matches message_broker_config.yaml host
+    image: cloudamqp/lavinmq:latest   # Docker Hub instead of GHCR
+    container_name: lavinmq0
     restart: unless-stopped
     ports:
-      - "5672:5672"                      # AMQP
-      - "15672:15672"                    # Management UI (adjust if you use a different port)
+      - "5672:5672"
+      - "15672:15672"
     volumes:
-      - ./lavinmq-data:/var/lib/lavinmq  # persistent broker data
-    healthcheck:
-      test: ["CMD", "bash", "-lc", "nc -z localhost 5672"]
-      interval: 5s
-      timeout: 3s
-      retries: 20
+      - ./lavinmq-data:/var/lib/lavinmq
 
-  robot-code:
+  robot-frontend:
     build:
       context: .
-      dockerfile: robot-code/Dockerfile
-    container_name: robot-code
-    image: robot-code:latest
+      dockerfile: robot-frontend/Dockerfile
+    image: robot-frontend:latest
+    container_name: robot-frontend
     restart: unless-stopped
     depends_on:
-      lavinmq:
-        condition: service_healthy
-
-    # Mount your YAML exactly as provided
-    volumes:
-      - ./robot-code/config/message_broker_config.yaml:/app/config/message_broker_config.yaml:ro
-
-    # Optional: show Tk window on Linux/X11 hosts
+      - lavinmq
     environment:
       - DISPLAY=${DISPLAY}
     volumes:
       - /tmp/.X11-unix:/tmp/.X11-unix
+      - ./robot-config/message_broker_config.yaml:/app/config/message_broker_config.yaml:ro
+
+  robot-backend:
+    build:
+      context: .
+      dockerfile: robot-backend/Dockerfile
+    image: robot-backend:latest
+    container_name: robot-backend
+    restart: unless-stopped
+    depends_on:
+      - lavinmq
+    environment:
+      - ROBOT_ID=r00
+    volumes:
+      - ./robot-config/message_broker_config.yaml:/app/config/message_broker_config.yaml:ro
