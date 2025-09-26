@@ -1,0 +1,36 @@
+services:
+  lavinmq:
+    image: cloudamqp/lavinmq:latest
+    container_name: lavinmq0            # <- matches message_broker_config.yaml host
+    restart: unless-stopped
+    ports:
+      - "5672:5672"                      # AMQP
+      - "15672:15672"                    # Management UI (adjust if you use a different port)
+    volumes:
+      - ./lavinmq-data:/var/lib/lavinmq  # persistent broker data
+    healthcheck:
+      test: ["CMD", "bash", "-lc", "nc -z localhost 5672"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  robot-code:
+    build:
+      context: .
+      dockerfile: robot-code/Dockerfile
+    container_name: robot-code
+    image: robot-code:latest
+    restart: unless-stopped
+    depends_on:
+      lavinmq:
+        condition: service_healthy
+
+    # Mount your YAML exactly as provided
+    volumes:
+      - ./robot-code/config/message_broker_config.yaml:/app/config/message_broker_config.yaml:ro
+
+    # Optional: show Tk window on Linux/X11 hosts
+    environment:
+      - DISPLAY=${DISPLAY}
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix
