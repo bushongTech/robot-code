@@ -1,13 +1,15 @@
 """
+robot-backend/main.py
+
 Why this file exists:
-- Single authority that listens to ROBOT_CMD_BC and drives the robot.
+- Backend service: the single authority that listens to ROBOT_CMD_BC and drives the robot.
 - Publishes telemetry (pose/process) to ROBOT_TLM on a steady cadence.
 - This is where RoboDK (and later: real controller I/O) lives.
 
 Flow:
-1) Read YAML and connect.
+1) Read YAML and connect to LavinMQ.
 2) Start a periodic telemetry publisher.
-3) Start a command consumer that handles UI requests (jog/goto/pause/stop).
+3) Start a command consumer that handles frontend requests (jog/goto/pause/stop).
 """
 
 import json
@@ -27,7 +29,8 @@ TLM_EXCHANGE = "ROBOT_TLM"
 CMD_QUEUE = "robot-commands"
 ROBOT_ID = os.environ.get("ROBOT_ID", "r00")
 
-# AMQP wrapper: declare infra, publish JSON, ack/nack helpers
+
+# --- MQ wrapper: declare infra, publish JSON, ack/nack helpers ---
 class MQ:
     def __init__(self, cfg):
         b = cfg["brokers"]["lavinmq"]
@@ -41,17 +44,18 @@ class MQ:
         self.conn = None
         self.ch = None
 
-    # connect once; we’ll reuse the channel
     def connect(self):
         params = pika.ConnectionParameters(
-            host=self.host, port=self.port, virtual_host=self.vhost,
+            host=self.host,
+            port=self.port,
+            virtual_host=self.vhost,
             credentials=pika.PlainCredentials(self.user, self.pw),
-            heartbeat=30, blocked_connection_timeout=300
+            heartbeat=30,
+            blocked_connection_timeout=300,
         )
         self.conn = pika.BlockingConnection(params)
         self.ch = self.conn.channel()
 
-    # idempotent: declare exchanges/queues from YAML every boot
     def declare_from_config(self):
         for ex in self.exchanges:
             ex_name = ex["name"]
@@ -61,7 +65,6 @@ class MQ:
                 self.ch.queue_declare(queue=q_name, durable=True)
                 self.ch.queue_bind(exchange=ex_name, queue=q_name)
 
-    # small publish helper
     def publish_json(self, exchange, payload):
         self.ch.basic_publish(
             exchange=exchange,
@@ -70,7 +73,6 @@ class MQ:
             properties=pika.BasicProperties(content_type="application/json", delivery_mode=2),
         )
 
-    # simple acks/nacks so we control retries later if we add a DLX
     def ack(self, tag):
         self.ch.basic_ack(tag)
 
@@ -78,7 +80,7 @@ class MQ:
         self.ch.basic_nack(tag, requeue=requeue)
 
 
-# config/pose helpers
+# --- helpers for config/pose ---
 def load_cfg():
     """Read YAML so we share a single source of truth across services."""
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -99,7 +101,7 @@ def read_pose_mm():
     }
 
 
-# publisher loop: push pose/process on a timer so UIs/loggers can watch the robot
+# --- telemetry publisher loop ---
 def telemetry_loop(mq: MQ, period=0.5):
     while True:
         pose = read_pose_mm()
@@ -114,20 +116,20 @@ def telemetry_loop(mq: MQ, period=0.5):
         time.sleep(period)
 
 
-# command dispatcher: decode JSON and route to the right handler (stubbed for now)
+# --- command handler ---
 def handle_command(cmd: dict):
     """
-    Commands we expect (examples):
+    Commands we expect:
     - {"cmd":"jog","axis":"X","delta":1.0,"units":"mm","ts":...}
     - {"cmd":"goto","x":100,"y":50,"z":20,"speed":200,"units":"mm","ts":...}
     - {"cmd":"pause"} | {"cmd":"stop"}
-    Wire these to RoboDK / controller here.
+    Wire these to RoboDK / hardware here.
     """
-    print("[CMD]", cmd, flush=True)
-    # TODO: integrate RoboDK/robot here
+    print("[BACKEND][CMD]", cmd, flush=True)
+    # TODO: integrate RoboDK API calls here
 
 
-# consumer loop: one authoritative controller reads UI commands and acts
+# --- consume frontend commands ---
 def consume_commands(mq: MQ, queue_name=CMD_QUEUE):
     mq.ch.basic_qos(prefetch_count=10)
 
@@ -140,7 +142,7 @@ def consume_commands(mq: MQ, queue_name=CMD_QUEUE):
             handle_command(payload)
             mq.ack(method.delivery_tag)
         except Exception as e:
-            print("[CMD][ERR]", e, flush=True)
+            print("[BACKEND][ERR]", e, flush=True)
             mq.nack(method.delivery_tag, requeue=False)
 
     mq.ch.basic_consume(queue=queue_name, on_message_callback=_cb, auto_ack=False)
@@ -148,7 +150,7 @@ def consume_commands(mq: MQ, queue_name=CMD_QUEUE):
 
 
 def main():
-    """Wire-up: connect → declare infra → start telemetry thread → start command consumer."""
+    """Wire-up: connect → declare infra → start telemetry thread → consume commands from frontend."""
     cfg = load_cfg()
     mq = MQ(cfg)
     mq.connect()
