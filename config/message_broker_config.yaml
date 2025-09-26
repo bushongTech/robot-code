@@ -1,0 +1,14 @@
+brokers:
+  lavinmq:
+    host: "lavinmq0"
+    port: 5672
+    username: "guest"
+    password: "guest" # pragma: allowlist secret
+    virtual_host: "/"
+    exchanges:
+      - name: TLM
+        queues:  # these are message recipients
+          - name: robot-telemetry
+      - name: CMD_BC
+        queues:  # these are message recipients
+          - name: robot-commands
