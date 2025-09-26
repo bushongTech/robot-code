@@ -1,38 +1,38 @@
 """
-robot-backend/main.py
+What this does:
+- Reads the same YAML as the frontend (single source of truth)
+- Connects to AMQP
+- Periodically publishes telemetry (pose/process) to ROBOT_TLM
+- Consumes commands from ROBOT_CMD_BC and acts on them (hook up RoboDK here)
 
-Why this file exists:
-- Backend service: the single authority that listens to ROBOT_CMD_BC and drives the robot.
-- Publishes telemetry (pose/process) to ROBOT_TLM on a steady cadence.
-- This is where RoboDK (and later: real controller I/O) lives.
-
-Flow:
-1) Read YAML and connect to LavinMQ.
-2) Start a periodic telemetry publisher.
-3) Start a command consumer that handles frontend requests (jog/goto/pause/stop).
+Notes:
+- Pose is faked for now so you can see packets moving; swap read_pose_mm() with RoboDK later.
+- Command shapes match the frontend: jog/goto/stop/pause/freeform.
 """
 
 import json
+import math
 import os
-import time
-import threading
 import signal
 import sys
-import math
+import threading
+import time
+from typing import Any, Dict, Optional
 
 import pika
 import yaml
-import RoboDK  # always imported here (backend needs it)
+import RoboDK  # required here; you’ll wire real robot I/O with it
 
-CONFIG_PATH = "/app/config/message_broker_config.yaml"
+# Config path (local, no containers)
+CONFIG_PATH = "./config/message_broker_config.yaml"
 TLM_EXCHANGE = "ROBOT_TLM"
-CMD_QUEUE = "robot-commands"
+CMD_QUEUE = "robot-commands"  # bound to ROBOT_CMD_BC in your YAML
 ROBOT_ID = os.environ.get("ROBOT_ID", "r00")
 
 
-# --- MQ wrapper: declare infra, publish JSON, ack/nack helpers ---
+# Same idea as the frontend: hide pika wiring so logic stays clean.
 class MQ:
-    def __init__(self, cfg):
+    def __init__(self, cfg: Dict[str, Any]) -> None:
         b = cfg["brokers"]["lavinmq"]
         self.host = b["host"]
         self.port = int(b.get("port", 5672))
@@ -41,10 +41,11 @@ class MQ:
         self.pw = b.get("password", "guest")
         self.exchanges = b.get("exchanges", [])
 
-        self.conn = None
-        self.ch = None
+        self.conn: Optional[pika.BlockingConnection] = None
+        self.ch: Optional[pika.adapters.blocking_connection.BlockingChannel] = None
 
-    def connect(self):
+    # Open channel we’ll reuse for everything
+    def connect(self) -> None:
         params = pika.ConnectionParameters(
             host=self.host,
             port=self.port,
@@ -56,16 +57,20 @@ class MQ:
         self.conn = pika.BlockingConnection(params)
         self.ch = self.conn.channel()
 
-    def declare_from_config(self):
+    # Declare exchanges/queues per YAML (idempotent)
+    def declare_from_config(self) -> None:
+        assert self.ch is not None
         for ex in self.exchanges:
-            ex_name = ex["name"]
-            self.ch.exchange_declare(exchange=ex_name, exchange_type="fanout", durable=True)
+            name = ex["name"]
+            self.ch.exchange_declare(exchange=name, exchange_type="fanout", durable=True)
             for q in ex.get("queues", []):
-                q_name = q["name"]
-                self.ch.queue_declare(queue=q_name, durable=True)
-                self.ch.queue_bind(exchange=ex_name, queue=q_name)
+                qn = q["name"]
+                self.ch.queue_declare(queue=qn, durable=True)
+                self.ch.queue_bind(exchange=name, queue=qn)
 
-    def publish_json(self, exchange, payload):
+    # Small helper to publish JSON telemetry
+    def publish_json(self, exchange: str, payload: Dict[str, Any]) -> None:
+        assert self.ch is not None
         self.ch.basic_publish(
             exchange=exchange,
             routing_key="",
@@ -73,24 +78,24 @@ class MQ:
             properties=pika.BasicProperties(content_type="application/json", delivery_mode=2),
         )
 
-    def ack(self, tag):
+    # Ack/nack wrappers (when we add retries/DLX later this gets handy)
+    def ack(self, tag) -> None:
+        assert self.ch is not None
         self.ch.basic_ack(tag)
 
-    def nack(self, tag, requeue=False):
+    def nack(self, tag, requeue: bool = False) -> None:
+        assert self.ch is not None
         self.ch.basic_nack(tag, requeue=requeue)
 
 
-# --- helpers for config/pose ---
-def load_cfg():
-    """Read YAML so we share a single source of truth across services."""
+# Read YAML once at boot
+def load_cfg() -> Dict[str, Any]:
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
-def read_pose_mm():
-    """
-    Read the current pose.
-    For now: fake a smooth motion. Swap with RoboDK API calls when wired.
-    """
+
+# Fake pose for now so you can see live telemetry without a robot attached.
+def read_pose_mm() -> Dict[str, Any]:
     t = time.time()
     return {
         "x": 500.0 + 50.0 * math.sin(t / 3.0),
@@ -101,39 +106,63 @@ def read_pose_mm():
     }
 
 
-# --- telemetry publisher loop ---
-def telemetry_loop(mq: MQ, period=0.5):
+# Push telemetry on a timer so UIs/loggers can just listen.
+def telemetry_loop(mq: MQ, period: float = 0.5) -> None:
     while True:
-        pose = read_pose_mm()
+        pose = read_pose_mm()  # TODO: replace with RoboDK pose read
         tlm = {
             "schema": "rfib.robot.tlm/1",
             "robot_id": ROBOT_ID,
             "pose": pose,
-            "process": {"state": "idle"},
+            "process": {"state": "idle"},  # TODO: surface real state when you have it
             "ts": time.time_ns(),
         }
         mq.publish_json(TLM_EXCHANGE, tlm)
         time.sleep(period)
 
 
-# --- command handler ---
-def handle_command(cmd: dict):
-    """
-    Commands we expect:
-    - {"cmd":"jog","axis":"X","delta":1.0,"units":"mm","ts":...}
-    - {"cmd":"goto","x":100,"y":50,"z":20,"speed":200,"units":"mm","ts":...}
-    - {"cmd":"pause"} | {"cmd":"stop"}
-    Wire these to RoboDK / hardware here.
-    """
-    print("[BACKEND][CMD]", cmd, flush=True)
-    # TODO: integrate RoboDK API calls here
+# Decode and handle commands here. Replace prints with real RoboDK/robot calls when ready.
+def handle_command(cmd: Dict[str, Any]) -> None:
+    kind = str(cmd.get("cmd", "")).lower()
+    print(f"[BACKEND][CMD] {cmd}", flush=True)
+
+    # TODO: wire these into real logic:
+    if kind == "jog":
+        axis = cmd.get("axis")
+        delta = float(cmd.get("delta", 0.0))
+        # RoboDK move: translate along axis by delta (mm). Your call whether tool/world frame.
+        # Example pseudo:
+        # rdk = RoboDK.Robolink()
+        # robot = rdk.Item('YourRobot', RoboDK.ITEM_TYPE_ROBOT)
+        # ... compute target pose delta ...
+        pass
+
+    elif kind == "goto":
+        x = float(cmd.get("x", 0.0))
+        y = float(cmd.get("y", 0.0))
+        z = float(cmd.get("z", 0.0))
+        speed = float(cmd.get("speed", 100.0))
+        units = cmd.get("units", "mm")
+        # RoboDK move: build a pose at (x,y,z) and execute at 'speed'.
+        # robot.setSpeed(speed)  # convert units if needed
+        # robot.MoveJ/MoveL(target_pose)
+        pass
+
+    elif kind in ("pause", "stop"):
+        # Hook up to your controller's pause/stop semantics
+        pass
+
+    else:
+        # Freeform or unknown: log for now
+        pass
 
 
-# --- consume frontend commands ---
-def consume_commands(mq: MQ, queue_name=CMD_QUEUE):
+# One authoritative consumer for commands from the frontend.
+def consume_commands(mq: MQ, queue_name: str = CMD_QUEUE) -> None:
+    assert mq.ch is not None
     mq.ch.basic_qos(prefetch_count=10)
 
-    def _cb(ch, method, props, body):
+    def _cb(ch, method, props, body: bytes):
         try:
             payload = json.loads(body.decode("utf-8"))
         except Exception:
@@ -149,14 +178,15 @@ def consume_commands(mq: MQ, queue_name=CMD_QUEUE):
     mq.ch.start_consuming()
 
 
-def main():
-    """Wire-up: connect → declare infra → start telemetry thread → consume commands from frontend."""
+# Wire-up: connect → declare → start telemetry thread → block on command consumer.
+def main() -> None:
     cfg = load_cfg()
     mq = MQ(cfg)
     mq.connect()
     mq.declare_from_config()
 
     threading.Thread(target=telemetry_loop, args=(mq, 0.5), daemon=True).start()
+
     signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
     consume_commands(mq, CMD_QUEUE)
 
