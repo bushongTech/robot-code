@@ -1,10 +1,13 @@
 """
-robot-frontend/main.py
+What this does:
+- Reads the YAML (so broker/exchange/queue names live in config, not code)
+- Connects to AMQP
+- Starts a background telemetry consumer (so the UI never blocks)
+- Tk UI lets you: Jog (X/Y/Z), STOP, PAUSE, GoTo (X/Y/Z + speed + units), and send raw JSON
 
-Tk UI that:
-- Publishes commands to ROBOT_CMD_BC
-- Subscribes to telemetry from ROBOT_TLM
-- Widgets: Jog (X/Y/Z), STOP, PAUSE, GoTo (X/Y/Z+speed+units), Freeform JSON
+Important:
+- Commands publish to ROBOT_CMD_BC
+- Telemetry is read from ROBOT_TLM (we just print it and drain so we don't balloon memory)
 """
 
 import json
@@ -13,20 +16,24 @@ import signal
 import sys
 import threading
 import time
+from typing import Any, Callable, Dict, Optional
 
 import pika
 import yaml
 import tkinter as tk
 from tkinter import ttk
 
-CONFIG_PATH = "/app/config/message_broker_config.yaml"
+# Config path (local, no containers)
+CONFIG_PATH = "./config/message_broker_config.yaml"
 TLM_EXCHANGE = "ROBOT_TLM"
 CMD_EXCHANGE = "ROBOT_CMD_BC"
 
 
-# --- AMQP wrapper: declare, publish JSON, consume TLM ---
+# Why this tiny class:
+# - Hide pika boilerplate so UI code stays readable.
+# - Give us: connect, declare (idempotent), publish JSON, consume with a handler.
 class AMQPClient:
-    def __init__(self, cfg):
+    def __init__(self, cfg: Dict[str, Any]) -> None:
         b = cfg["brokers"]["lavinmq"]
         self.host = b["host"]
         self.port = int(b.get("port", 5672))
@@ -34,29 +41,39 @@ class AMQPClient:
         self.password = b.get("password", "guest")
         self.vhost = b.get("virtual_host", "/")
         self.exchanges = b.get("exchanges", [])
-        self._conn = None
-        self._chan = None
+
+        self._conn: Optional[pika.BlockingConnection] = None
+        self._chan: Optional[pika.adapters.blocking_connection.BlockingChannel] = None
         self._closing = False
 
-    def connect(self):
+    # Open connection/channel once and reuse it everywhere.
+    def connect(self) -> None:
         creds = pika.PlainCredentials(self.username, self.password)
         params = pika.ConnectionParameters(
-            host=self.host, port=self.port, virtual_host=self.vhost,
-            credentials=creds, heartbeat=30, blocked_connection_timeout=300
+            host=self.host,
+            port=self.port,
+            virtual_host=self.vhost,
+            credentials=creds,
+            heartbeat=30,
+            blocked_connection_timeout=300,
         )
         self._conn = pika.BlockingConnection(params)
         self._chan = self._conn.channel()
 
-    def declare_from_config(self):
+    # Create exchanges/queues on every boot. Safe + keeps infra drift from biting us.
+    def declare_from_config(self) -> None:
+        assert self._chan is not None
         for ex in self.exchanges:
-            ex_name = ex["name"]
-            self._chan.exchange_declare(exchange=ex_name, exchange_type="fanout", durable=True)
+            name = ex["name"]
+            self._chan.exchange_declare(exchange=name, exchange_type="fanout", durable=True)
             for q in ex.get("queues", []):
-                q_name = q["name"]
-                self._chan.queue_declare(queue=q_name, durable=True)
-                self._chan.queue_bind(exchange=ex_name, queue=q_name)
+                qn = q["name"]
+                self._chan.queue_declare(queue=qn, durable=True)
+                self._chan.queue_bind(exchange=name, queue=qn)
 
-    def publish_json(self, exchange, payload):
+    # One-liner JSON publish so buttons can stay tiny.
+    def publish_json(self, exchange: str, payload: Dict[str, Any]) -> None:
+        assert self._chan is not None
         body = json.dumps(payload).encode("utf-8")
         self._chan.basic_publish(
             exchange=exchange,
@@ -65,8 +82,9 @@ class AMQPClient:
             properties=pika.BasicProperties(content_type="application/json", delivery_mode=2),
         )
 
-    def consume_forever(self, queue_name, handler):
-        def _cb(ch, method, props, body):
+    # Put the consumer on a background thread; if the broker hiccups, reconnect and keep going.
+    def consume_forever(self, queue_name: str, handler: Callable[[Dict[str, Any]], None]) -> None:
+        def _cb(ch, method, props, body: bytes):
             try:
                 msg = json.loads(body.decode("utf-8"))
             except Exception:
@@ -76,6 +94,7 @@ class AMQPClient:
 
         while not self._closing:
             try:
+                assert self._chan is not None
                 self._chan.basic_qos(prefetch_count=32)
                 self._chan.basic_consume(queue=queue_name, on_message_callback=_cb, auto_ack=False)
                 self._chan.start_consuming()
@@ -86,7 +105,8 @@ class AMQPClient:
                 self.connect()
                 self.declare_from_config()
 
-    def close(self):
+    # Clean close so we don’t leave consuming loops angry.
+    def close(self) -> None:
         self._closing = True
         try:
             if self._chan and self._chan.is_open:
@@ -100,21 +120,24 @@ class AMQPClient:
             pass
 
 
-def load_config():
+# Helper: read YAML so broker/exchange names come from config.
+def load_config() -> Dict[str, Any]:
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
-def first_queue_for_exchange(cfg, name):
+# Helper: grab the first queue bound to an exchange (good enough for this UI).
+def first_queue_for_exchange(cfg: Dict[str, Any], ex_name: str) -> Optional[str]:
     for ex in cfg["brokers"]["lavinmq"].get("exchanges", []):
-        if ex.get("name") == name:
+        if ex.get("name") == ex_name:
             qs = ex.get("queues", [])
             return qs[0]["name"] if qs else None
     return None
 
 
+# All the UI gunk lives here so main() is just wiring.
 class RobotUI:
-    def __init__(self, amqp, cmd_exchange, tlm_fifo):
+    def __init__(self, amqp: AMQPClient, cmd_exchange: str, tlm_fifo: "queue.Queue[dict]"):
         self.amqp = amqp
         self.cmd_exchange = cmd_exchange
         self.tlm_fifo = tlm_fifo
@@ -122,19 +145,20 @@ class RobotUI:
         self.root = tk.Tk()
         self.root.title("Robot Frontend (Tk)")
 
+        # Layout scaffolding
         container = ttk.Frame(self.root, padding=12)
         container.grid(column=0, row=0, sticky="nsew")
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
 
-        # Freeform JSON
+        # Freeform JSON (escape hatch for weird stuff)
         ttk.Label(container, text="Command JSON:").grid(column=0, row=0, sticky="w")
         self.cmd_box = tk.Text(container, width=72, height=6)
         self.cmd_box.grid(column=0, row=1, sticky="nsew", pady=(4, 6))
         self.cmd_box.insert("1.0", json.dumps({"cmd": "ping", "ts": time.time_ns()}, indent=2))
         ttk.Button(container, text="Send JSON", command=self.send_freeform).grid(column=0, row=2, sticky="e")
 
-        # Jog panel
+        # Jog panel (just quick nudges; fixed step for now)
         jog = ttk.LabelFrame(container, text="Jog", padding=8)
         jog.grid(column=0, row=3, sticky="ew", pady=(8, 6))
         for i in range(3):
@@ -146,7 +170,7 @@ class RobotUI:
         ttk.Button(jog, text="Forward (+Y)", command=lambda: self.jog("Y", +1)).grid(column=1, row=1, pady=2)
         ttk.Button(jog, text="Back (-Y)", command=lambda: self.jog("Y", -1)).grid(column=1, row=3, pady=2)
 
-        # STOP / PAUSE
+        # STOP / PAUSE — simple and loud
         sp = ttk.Frame(container)
         sp.grid(column=0, row=4, sticky="ew", pady=(6, 6))
         ttk.Button(sp, text="STOP", command=self.stop).grid(column=0, row=0, padx=4)
@@ -172,31 +196,35 @@ class RobotUI:
         ttk.Combobox(goto, textvariable=self.units_var, values=["mm", "in"], width=6, state="readonly").grid(column=9, row=0)
         ttk.Button(goto, text="Go", command=self.go_to).grid(column=10, row=0, padx=6)
 
-        # Status line
+        # Status line (because feedback beats guessing)
         self.status = tk.StringVar(value="Ready.")
         ttk.Label(container, textvariable=self.status).grid(column=0, row=6, sticky="w", pady=(8, 0))
 
-        # Telemetry drain (keep FIFO bounded)
+        # Drain telemetry FIFO on a timer so the buffer never runs away
         self._pump_fifo()
 
-    def _send(self, payload, ok_msg):
+    # Keep button handlers tiny: shove all publish + status setting here.
+    def _send(self, payload: Dict[str, Any], ok_msg: str) -> None:
         try:
             self.amqp.publish_json(self.cmd_exchange, payload)
             self.status.set(ok_msg)
         except Exception as e:
             self.status.set(f"Publish failed: {e}")
 
-    def jog(self, axis, sign):
-        payload = {"cmd": "jog", "axis": axis, "delta": sign * 1.0, "units": "mm", "ts": time.time_ns()}
+    # Jog = fixed 1.0 unit for now (mm by default)
+    def jog(self, axis: str, sign: int) -> None:
+        payload = {"cmd": "jog", "axis": axis, "delta": 1.0 if sign >= 0 else -1.0, "units": "mm", "ts": time.time_ns()}
         self._send(payload, f"Jog {axis} {payload['delta']} mm")
 
-    def stop(self):
+    # Stop = hard stop; Pause = soft hold (backend decides the details)
+    def stop(self) -> None:
         self._send({"cmd": "stop", "ts": time.time_ns()}, "STOP sent")
 
-    def pause(self):
+    def pause(self) -> None:
         self._send({"cmd": "pause", "ts": time.time_ns()}, "PAUSE sent")
 
-    def go_to(self):
+    # Absolute move: X/Y/Z + speed + units to the backend
+    def go_to(self) -> None:
         payload = {
             "cmd": "goto",
             "x": float(self.x_var.get()),
@@ -208,36 +236,40 @@ class RobotUI:
         }
         self._send(payload, f"GoTo {payload['x']},{payload['y']},{payload['z']} {payload['units']} @ {payload['speed']}")
 
-    def send_freeform(self):
+    # Raw JSON sender (nice for quick tests)
+    def send_freeform(self) -> None:
         raw = self.cmd_box.get("1.0", "end").strip()
         try:
             payload = json.loads(raw)
+            payload.setdefault("ts", time.time_ns())
             self._send(payload, "Freeform sent")
         except Exception:
             self.status.set("Invalid JSON")
 
-    def _pump_fifo(self):
-        # drain some telemetry so memory doesn't grow forever
+    # Don’t let telemetry pile up forever — drain a bit each tick.
+    def _pump_fifo(self) -> None:
         drained = 0
         while not self.tlm_fifo.empty() and drained < 50:
             _ = self.tlm_fifo.get_nowait()
             drained += 1
         self.root.after(250, self._pump_fifo)
 
-    def run(self):
+    # Hand control to Tk
+    def run(self) -> None:
         self.root.mainloop()
 
 
-def main():
+# Wire-up: load config -> connect -> declare -> start telemetry consumer -> start UI.
+def main() -> None:
     cfg = load_config()
     amqp = AMQPClient(cfg)
     amqp.connect()
     amqp.declare_from_config()
 
     tlm_queue = first_queue_for_exchange(cfg, TLM_EXCHANGE) or "robot-telemetry"
-    tlm_fifo = queue.Queue()
+    tlm_fifo: "queue.Queue[dict]" = queue.Queue()
 
-    def on_tlm(msg):
+    def on_tlm(msg: Dict[str, Any]) -> None:
         tlm_fifo.put(msg)
         print("[TLM]", json.dumps(msg), flush=True)
 
@@ -245,6 +277,7 @@ def main():
     t.start()
 
     ui = RobotUI(amqp, CMD_EXCHANGE, tlm_fifo)
+
     signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
     ui.run()
 
